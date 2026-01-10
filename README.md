@@ -28,7 +28,6 @@ During installation, check:
 
 ☑ Add Python to PATH
 
-
 Verify:
 
 python --version
@@ -41,7 +40,6 @@ pip install easyocr pillow pyautogui numpy sympy opencv-python
 
 3️⃣ Run the program
 python main.py
-
 
 Replace main.py with the actual filename if different.
 
@@ -61,7 +59,6 @@ Terminal logs detected expressions and actions
 1️⃣ Install Python
 brew install python
 
-
 Verify:
 
 python3 --version
@@ -74,7 +71,6 @@ pip3 install easyocr pillow pyautogui numpy sympy opencv-python
 Go to:
 
 System Settings → Privacy & Security
-
 
 Enable:
 
@@ -100,21 +96,18 @@ macOS users may comment out setup_overlay_boxes() for stability.
 OCR Capture Area
 QUESTION_AREA = (410, 182, 711, 227)
 
-
 Format:
 
 (x1, y1, x2, y2)
-
 
 Adjust this to match where questions appear on your screen.
 
 Keypad Coordinates
 KEY_COORDS = {
-    '0': (486, 613),
-    '1': (464, 537),
-    ...
+'0': (486, 613),
+'1': (464, 537),
+...
 }
-
 
 Coordinates must match:
 
@@ -154,7 +147,6 @@ Adjust threshold value:
 
 img.point(lambda x: 0 if x < 140 else 255)
 
-
 Incorrect clicks
 
 Verify KEY_COORDS
@@ -178,3 +170,7 @@ Screen coordinates are environment-specific
 This project is intended for educational and experimental use
 
 Logic and overlays are modular and can be extended
+
+### Demo of Sparx Solver in action
+
+![Sparx Solver Demo](demo.gif)
