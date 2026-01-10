@@ -1,5 +1,5 @@
-import easyocr
-from PIL import ImageGrab, Image, ImageTk
+import easyocr  # <--- THIS WAS MISSING
+from PIL import ImageGrab, Image
 import pyautogui
 import numpy as np
 import tkinter as tk
@@ -8,27 +8,49 @@ import re
 import time
 import sys
 import ctypes
+from pynput import keyboard
+
+# ----------------- DPI & SCALING SETUP -----------------
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
+REF_W = 1366
+REF_H = 768
+CURR_W, CURR_H = pyautogui.size()
+SCALE_X = CURR_W / REF_W
+SCALE_Y = CURR_H / REF_H
+
+print(f"Screen: {CURR_W}x{CURR_H} (Scaling: {SCALE_X:.2f}x, {SCALE_Y:.2f}x)")
+
+def s_xy(x, y):
+    return (int(x * SCALE_X), int(y * SCALE_Y))
+
+def s_bbox(bbox):
+    return (int(bbox[0] * SCALE_X), int(bbox[1] * SCALE_Y), 
+            int(bbox[2] * SCALE_X), int(bbox[3] * SCALE_Y))
 
 # ----------------- WINDOWS CONSTANTS -----------------
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
 GWL_EXSTYLE = -20
 
-# ----------------- CONFIG -----------------
-# Shifting the box right (350 -> 300) and down (100 -> 220) 
-# and making it wider/taller to ensure the question fits.
-QUESTION_AREA = (410, 182, 711, 227)
-
-
-
-
-KEY_COORDS = {
+# ----------------- CONFIG (AUTO-SCALED) -----------------
+ORIGINAL_QUESTION_AREA = (411, 182, 722, 231)
+ORIGINAL_KEY_COORDS = {
     '0': (486, 613), '1': (464, 537), '2': (533, 534), '3': (606, 530),
     '4': (453, 456), '5': (531, 460), '6': (615, 455),
     '7': (453, 378), '8': (530, 381), '9': (613, 381), 'OK': (689, 576)
 }
 
-POLLING_INTERVAL_MS =1
+QUESTION_AREA = s_bbox(ORIGINAL_QUESTION_AREA)
+KEY_COORDS = {k: s_xy(v[0], v[1]) for k, v in ORIGINAL_KEY_COORDS.items()}
+
+# Mode-specific polling intervals
+CLUB_MODE_POLLING = 10
+GAMES_MODE_POLLING = 150
+
 KEY_PRESS_DELAY = 0
 POST_ANSWER_DELAY = 0
 
@@ -38,37 +60,89 @@ class MathSolverBot:
     def __init__(self, q_area, key_coords):
         self.question_area = q_area
         self.key_coords = key_coords
-        self.reader = easyocr.Reader(['en'])
+        self.reader = easyocr.Reader(['en'], gpu=True)  # Enable GPU if available
         self.last_question = ""
+        self.paused = False
+        self.overlays_visible = True
+        self.club_mode = True  # Start in Club mode by default
+        self.current_polling = CLUB_MODE_POLLING
+        
+        # Pre-compile regex patterns for speed (Optimized from Code A)
+        self.operator_clean = re.compile(r'[^\d\s\+\-\*/\(\)=?]')
+        self.space_clean = re.compile(r'\s*([\+\-\*/\(\)=])\s*')
+        self.div_pattern = re.compile(r"(\d{3})\s+(\d{1,2})\s*=\s*\?")
+        self.mult_pattern = re.compile(r"(\d+)\s+(\d+)")
+        
+        # Cache for sympy symbol (Optimized from Code A)
+        self.x_symbol = symbols('x')
 
         self.setup_gui()
         self.setup_overlay_boxes()
+        self.setup_keyboard_listener()
 
     def setup_gui(self):
         self.root = tk.Tk()
-        self.root.title("Question Preview")
-        self.root.geometry("300x150+50+50")
+        self.root.title("Math Solver Bot")
+        self.root.geometry("220x140+50+50")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
 
-        self.canvas = tk.Canvas(self.root, width=300, height=150)
-        self.canvas.pack()
-        self.img_tk = None
+        status_label = tk.Label(self.root, text="Status:", font=("Arial", 10, "bold"))
+        status_label.pack(pady=5)
+        
+        self.status_text = tk.Label(self.root, text="RUNNING", fg="green", font=("Arial", 12, "bold"))
+        self.status_text.pack(pady=2)
+        
+        self.mode_text = tk.Label(self.root, text="Mode: CLUB (10ms)", fg="blue", font=("Arial", 9, "bold"))
+        self.mode_text.pack(pady=2)
+        
+        info_label = tk.Label(self.root, text="F9: Pause/Resume", font=("Arial", 8))
+        info_label.pack(pady=1)
+        
+        overlay_label = tk.Label(self.root, text="F10: Toggle Overlays", font=("Arial", 8))
+        overlay_label.pack(pady=1)
+        
+        mode_label = tk.Label(self.root, text="F11: Switch Mode", font=("Arial", 8))
+        mode_label.pack(pady=1)
+
+    def setup_keyboard_listener(self):
+        def on_press(key):
+            try:
+                if key == keyboard.Key.f9:
+                    self.paused = not self.paused
+                    status = "PAUSED" if self.paused else "RUNNING"
+                    color = "red" if self.paused else "green"
+                    self.status_text.config(text=status, fg=color)
+                    print(f"Bot {status}")
+                elif key == keyboard.Key.f10:
+                    self.overlays_visible = not self.overlays_visible
+                    self.toggle_overlays()
+                    print(f"Overlays {'SHOWN' if self.overlays_visible else 'HIDDEN'}")
+                elif key == keyboard.Key.f11:
+                    self.club_mode = not self.club_mode
+                    self.current_polling = CLUB_MODE_POLLING if self.club_mode else GAMES_MODE_POLLING
+                    mode_name = "CLUB (10ms)" if self.club_mode else "GAMES (150ms)"
+                    self.mode_text.config(text=f"Mode: {mode_name}")
+                    print(f"Switched to {mode_name} mode")
+            except Exception as e:
+                pass
+        
+        self.listener = keyboard.Listener(on_press=on_press)
+        self.listener.start()
 
     def setup_overlay_boxes(self):
         self.overlay_windows = []
 
-        # OCR area - LABEL REMOVED HERE
         x1, y1, x2, y2 = self.question_area
         self.create_overlay_box(
             x1, y1, x2 - x1, y2 - y1,
-            "red", ""  # Empty string means no text label
+            "red", ""
         )
 
-        # Key buttons
+        box_size = int(50 * SCALE_X)
         for key, (x, y) in self.key_coords.items():
             self.create_overlay_box(
-                x - 25, y - 25, 50, 50,
+                x - (box_size // 2), y - (box_size // 2), box_size, box_size,
                 "cyan", key
             )
 
@@ -78,7 +152,7 @@ class MathSolverBot:
         win.attributes("-topmost", True)
         win.geometry(f"{w}x{h}+{x}+{y}")
 
-        transparent_bg = "black" 
+        transparent_bg = "black"
         win.config(bg=transparent_bg)
         win.attributes("-transparentcolor", transparent_bg)
 
@@ -91,7 +165,6 @@ class MathSolverBot:
             width=3
         )
         
-        # Only draw text if a label is provided
         if label:
             canvas.create_text(
                 w // 2, 10, 
@@ -108,25 +181,30 @@ class MathSolverBot:
 
         self.overlay_windows.append(win)
 
+    def toggle_overlays(self):
+        for win in self.overlay_windows:
+            if self.overlays_visible:
+                win.deiconify()
+            else:
+                win.withdraw()
+
     def normalize_operators(self, expr):
-        expr = expr.replace('×', '*').replace('x', '*').replace('X', '*')
-        expr = expr.replace('÷', '/').replace(':', '/')
-        expr = re.sub(r'[^\d\s\+\-\*/\(\)=?]', '', expr)
-        return expr
+        expr = expr.replace('×', '*').replace('x', '*').replace('X', '*').replace('÷', '/').replace(':', '/')
+        return self.operator_clean.sub('', expr)
 
     def fix_missing_operator(self, expr):
         if '(' not in expr and ')' not in expr and '+' in expr:
             return expr.replace('+', '/', 1)
-        div_pattern = r"(\d{3})\s+(\d{1,2})\s*=\s*\?"
-        match = re.search(div_pattern, expr)
+        match = self.div_pattern.search(expr)
         if match:
             return f"{match.group(1)} / {match.group(2)} = ?"
-        return re.sub(r"(\d+)\s+(\d+)", r"\1 * \2", expr, count=1)
+        return self.mult_pattern.sub(r"\1 * \2", expr, count=1)
 
     def finalize_expression(self, expr):
-        expr = re.sub(r'\s*([\+\-\*/\(\)=])\s*', r'\1', expr)
-        if expr.count('(') > expr.count(')'):
-            expr += ')' * (expr.count('(') - expr.count(')'))
+        expr = self.space_clean.sub(r'\1', expr)
+        paren_diff = expr.count('(') - expr.count(')')
+        if paren_diff > 0:
+            expr += ')' * paren_diff
         return expr
 
     def solve_algebra(self, expr):
@@ -134,9 +212,8 @@ class MathSolverBot:
             if '?' not in expr:
                 result = N(sympify(expr))
                 return int(result) if result.is_integer else float(result)
-            x = symbols('x')
             lhs, rhs = expr.replace('?', 'x').split('=')
-            sol = solve(Eq(sympify(lhs), sympify(rhs)), x)
+            sol = solve(Eq(sympify(lhs), sympify(rhs)), self.x_symbol)
             if sol:
                 result = N(sol[0])
                 return int(result) if result.is_integer else float(result)
@@ -145,60 +222,60 @@ class MathSolverBot:
         return None
 
     def click_answer(self, answer):
-        print(f"Clicking answer: {answer}")
-        for d in str(int(answer)):
-            if d in self.key_coords:
-                pyautogui.click(self.key_coords[d])
+        answer_str = str(int(answer))
+        print(f"Clicking answer: {answer_str}")
+        for d in answer_str:
+            pyautogui.click(self.key_coords[d])
+            if KEY_PRESS_DELAY > 0:
                 time.sleep(KEY_PRESS_DELAY)
         pyautogui.click(self.key_coords['OK'])
-        time.sleep(POST_ANSWER_DELAY)
+        if POST_ANSWER_DELAY > 0:
+            time.sleep(POST_ANSWER_DELAY)
 
     def main_loop(self):
         try:
-            img = ImageGrab.grab(bbox=self.question_area)
-            img = img.convert("L")
-            img = img.point(lambda x: 0 if x < 140 else 255)
+            if not self.paused:
+                img = ImageGrab.grab(bbox=self.question_area)
+                
+                # Fast image preprocessing (Numpy is faster than PIL lambda)
+                img_array = np.array(img.convert("L"))
+                img_array[img_array < 140] = 0
+                img_array[img_array >= 140] = 255
 
-
-           # --- REMOVE PREVIEW ---
-# preview = ImageTk.PhotoImage(img.resize((300, 150)))
-# self.canvas.create_image(0, 0, anchor=tk.NW, image=preview)
-# self.img_tk = preview
-# ----------------------
-
-            result = self.reader.readtext(
-                np.array(img),
-                allowlist='0123456789+-*/()=?xX×÷: ',
-                low_text=0.4,
-                batch_size=4,
-                min_size=5
-            )
-
-            question = " ".join(t for _, t, _ in result).strip()
-            
-            if question and question != self.last_question:
-                self.last_question = question
-                print(f"Detected: {question}")
-                expr = self.finalize_expression(
-                    self.fix_missing_operator(
-                        self.normalize_operators(question)
-                    )
+                result = self.reader.readtext(
+                    img_array,
+                    allowlist='0123456789+-*/()=?xX×÷: ',
+                    low_text=0.4,
+                    batch_size=4,
+                    min_size=5
                 )
-                answer = self.solve_algebra(expr)
-                if answer is not None and float(answer).is_integer():
-                    self.click_answer(int(answer))
+
+                if result:
+                    question = " ".join(t for _, t, _ in result)
+                    
+                    if question != self.last_question:
+                        self.last_question = question
+                        print(f"Detected: {question}")
+                        expr = self.finalize_expression(
+                            self.fix_missing_operator(
+                                self.normalize_operators(question)
+                            )
+                        )
+                        answer = self.solve_algebra(expr)
+                        if answer is not None and float(answer).is_integer():
+                            self.click_answer(int(answer))
         except Exception as e:
             print(f"Loop Error: {e}")
-        self.root.after(POLLING_INTERVAL_MS, self.main_loop)
+        
+        # Use current polling interval based on mode
+        self.root.after(self.current_polling, self.main_loop)
 
     def run(self):
-        print("MathSolverBot running. Press Ctrl+C in terminal to stop.")
+        print("MathSolverBot running.")
+        print("F9: Pause/Resume | F10: Toggle Overlays | F11: Switch Mode | Ctrl+C: Stop")
+        print("Starting in CLUB mode (10ms polling)")
         self.root.after(200, self.main_loop)
         self.root.mainloop()
 
 if __name__ == "__main__":
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
     MathSolverBot(QUESTION_AREA, KEY_COORDS).run()
