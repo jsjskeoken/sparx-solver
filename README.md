@@ -1,3 +1,5 @@
+Features
+
 📸 Screen capture using PIL.ImageGrab
 
 🔍 OCR via EasyOCR
@@ -12,93 +14,85 @@
 
 🪟 Mouse clicks pass through overlays (Windows only)
 
-📦 Requirements
+Requirements
 
 Python 3.9+
 
-pip
+pip package manager
 
-Supported OS (see table above)
+Supported OS: Windows (recommended), macOS (limited support)
 
-🪟 Windows Setup (Recommended)
-1️⃣ Install Python
+Installation
+1️⃣ Windows Setup (Recommended)
+
+Install Python
 
 Download Python from the official website
-During installation, check:
 
-☑ Add Python to PATH
+During installation, check “Add Python to PATH”
 
-Verify:
+Verify installation:
 
 python --version
 
-2️⃣ Install dependencies
-
-In the project directory:
+Install dependencies
+Open a terminal in the project directory and run:
 
 pip install easyocr pillow pyautogui numpy sympy opencv-python
 
-3️⃣ Run the program
+Run the program
+
 python main.py
 
 Replace main.py with the actual filename if different.
 
-4️⃣ Expected behaviour
+Expected behaviour
 
 Red box → OCR capture area
 
 Cyan boxes → keypad button locations
 
-Overlays are always on top
+Overlays always on top
 
 Mouse clicks pass through overlays
 
 Terminal logs detected expressions and actions
 
-🍎 macOS Setup (Limited Support)
-1️⃣ Install Python
+2️⃣ macOS Setup (Limited Support)
+
+Install Python
+
 brew install python
-
-Verify:
-
 python3 --version
 
-2️⃣ Install dependencies
+Install dependencies
+
 pip3 install easyocr pillow pyautogui numpy sympy opencv-python
 
-3️⃣ Grant permissions
+Grant permissions
+Go to System Settings → Privacy & Security
 
-Go to:
+Enable Screen Recording for Terminal/IDE
 
-System Settings → Privacy & Security
+Enable Accessibility for Terminal/IDE
 
-Enable:
+Restart Terminal after enabling
 
-Screen Recording → Terminal / IDE
+⚠️ Limitations on macOS
 
-Accessibility → Terminal / IDE
-
-Restart Terminal after enabling permissions.
-
-⚠️ macOS Limitations
-
-Transparent overlays are not supported
+Transparent overlays not supported
 
 ctypes.windll is Windows-only
 
-OCR, solving, and logic still function
-
 Auto-clicking depends on accessibility permissions
 
-macOS users may comment out setup_overlay_boxes() for stability.
+OCR, solving, and logic still work
 
-⚙️ Configuration
+macOS users may comment out setup_overlay_boxes() for stability
+
+Configuration
 OCR Capture Area
-QUESTION_AREA = (410, 182, 711, 227)
-
-Format:
-
-(x1, y1, x2, y2)
+QUESTION_AREA = (410, 182, 711, 227) # (x1, y1, x2, y2)
 
 Adjust this to match where questions appear on your screen.
 
@@ -106,18 +100,13 @@ Keypad Coordinates
 KEY_COORDS = {
 '0': (486, 613),
 '1': (464, 537),
-...
+'2': (533, 534), # ...
+'OK': (689, 576)
 }
 
-Coordinates must match:
+Must match screen resolution, application layout, and display scaling (Windows DPI)
 
-Screen resolution
-
-Application layout
-
-Display scaling (Windows DPI)
-
-🧪 How It Works (Pipeline)
+How It Works (Pipeline)
 
 Capture OCR region
 
@@ -125,7 +114,7 @@ Convert image to grayscale
 
 Apply thresholding
 
-OCR text detection
+Detect text with OCR
 
 Normalise operators (×, ÷, etc.)
 
@@ -135,7 +124,7 @@ Solve expression
 
 Click digits + OK button
 
-🧯 Troubleshooting
+Troubleshooting
 
 OCR results are inaccurate
 
@@ -163,13 +152,29 @@ Disable DPI scaling
 
 Ensure Python is not sandboxed
 
-📝 Notes
+Notes
 
 Screen coordinates are environment-specific
 
-This project is intended for educational and experimental use
+Intended for educational and experimental use
 
-Logic and overlays are modular and can be extended
+Logic and overlays are modular and extensible
+
+Quick Start – Imports Reference
+
+All main imports are at the top for easy reference:
+
+import easyocr
+from PIL import ImageGrab, Image, ImageTk
+import pyautogui
+import numpy as np
+import tkinter as tk
+from sympy import symbols, Eq, solve, sympify, N
+import re
+import time
+import sys
+import ctypes
+from pynput import keyboard
 
 ### Demo of Sparx Solver in action
 
