@@ -1,4 +1,4 @@
-🧮 Sparx Maths Auto-Solver & XP Farmer
+🧮 Sparx Maths Auto-Solver (specifically for times tables can automate 100 club check)
 
 A high-performance, Python-based automation tool designed to visually read, solve, and answer math questions on screen. It utilizes Optical Character Recognition (OCR) to detect equations and simulates mouse input to answer them instantly.
 
