@@ -1,4 +1,4 @@
-import easyocr  # <--- THIS WAS MISSING
+import easyocr
 from PIL import ImageGrab, Image
 import pyautogui
 import numpy as np
@@ -44,8 +44,16 @@ ORIGINAL_KEY_COORDS = {
     '7': (453, 378), '8': (530, 381), '9': (613, 381), 'OK': (689, 576)
 }
 
+# Automation click areas
+ORIGINAL_AUTO_AREA_1 = (510, 686)  # First click after 10 answers
+ORIGINAL_AUTO_AREA_2 = (157, 745)  # Second click in sequence
+ORIGINAL_AUTO_AREA_3 = (274, 430)  # Third click in sequence
+
 QUESTION_AREA = s_bbox(ORIGINAL_QUESTION_AREA)
 KEY_COORDS = {k: s_xy(v[0], v[1]) for k, v in ORIGINAL_KEY_COORDS.items()}
+AUTO_AREA_1 = s_xy(ORIGINAL_AUTO_AREA_1[0], ORIGINAL_AUTO_AREA_1[1])
+AUTO_AREA_2 = s_xy(ORIGINAL_AUTO_AREA_2[0], ORIGINAL_AUTO_AREA_2[1])
+AUTO_AREA_3 = s_xy(ORIGINAL_AUTO_AREA_3[0], ORIGINAL_AUTO_AREA_3[1])
 
 # Mode-specific polling intervals
 CLUB_MODE_POLLING = 10
@@ -60,20 +68,24 @@ class MathSolverBot:
     def __init__(self, q_area, key_coords):
         self.question_area = q_area
         self.key_coords = key_coords
-        self.reader = easyocr.Reader(['en'], gpu=True)  # Enable GPU if available
+        self.reader = easyocr.Reader(['en'], gpu=True)
         self.last_question = ""
         self.paused = False
         self.overlays_visible = True
-        self.club_mode = True  # Start in Club mode by default
+        self.club_mode = True
         self.current_polling = CLUB_MODE_POLLING
         
-        # Pre-compile regex patterns for speed (Optimized from Code A)
+        # Automation counters
+        self.answers_count = 0
+        self.ready_count = 0
+        
+        # Pre-compile regex patterns for speed
         self.operator_clean = re.compile(r'[^\d\s\+\-\*/\(\)=?]')
         self.space_clean = re.compile(r'\s*([\+\-\*/\(\)=])\s*')
         self.div_pattern = re.compile(r"(\d{3})\s+(\d{1,2})\s*=\s*\?")
         self.mult_pattern = re.compile(r"(\d+)\s+(\d+)")
         
-        # Cache for sympy symbol (Optimized from Code A)
+        # Cache for sympy symbol
         self.x_symbol = symbols('x')
 
         self.setup_gui()
@@ -83,7 +95,7 @@ class MathSolverBot:
     def setup_gui(self):
         self.root = tk.Tk()
         self.root.title("Math Solver Bot")
-        self.root.geometry("220x140+50+50")
+        self.root.geometry("220x180+50+50")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
 
@@ -95,6 +107,10 @@ class MathSolverBot:
         
         self.mode_text = tk.Label(self.root, text="Mode: CLUB (10ms)", fg="blue", font=("Arial", 9, "bold"))
         self.mode_text.pack(pady=2)
+        
+        # Automation counter display
+        self.counter_text = tk.Label(self.root, text="Answers: 0/10 | Ready: 0", fg="orange", font=("Arial", 9, "bold"))
+        self.counter_text.pack(pady=2)
         
         info_label = tk.Label(self.root, text="F9: Pause/Resume", font=("Arial", 8))
         info_label.pack(pady=1)
@@ -145,6 +161,24 @@ class MathSolverBot:
                 x - (box_size // 2), y - (box_size // 2), box_size, box_size,
                 "cyan", key
             )
+        
+        # Automation area highlights
+        auto_box_size = int(60 * SCALE_X)
+        self.create_overlay_box(
+            AUTO_AREA_1[0] - (auto_box_size // 2), AUTO_AREA_1[1] - (auto_box_size // 2),
+            auto_box_size, auto_box_size,
+            "yellow", "AUTO 1"
+        )
+        self.create_overlay_box(
+            AUTO_AREA_2[0] - (auto_box_size // 2), AUTO_AREA_2[1] - (auto_box_size // 2),
+            auto_box_size, auto_box_size,
+            "magenta", "AUTO 2"
+        )
+        self.create_overlay_box(
+            AUTO_AREA_3[0] - (auto_box_size // 2), AUTO_AREA_3[1] - (auto_box_size // 2),
+            auto_box_size, auto_box_size,
+            "lime", "AUTO 3"
+        )
 
     def create_overlay_box(self, x, y, w, h, color, label):
         win = tk.Toplevel(self.root)
@@ -231,13 +265,65 @@ class MathSolverBot:
         pyautogui.click(self.key_coords['OK'])
         if POST_ANSWER_DELAY > 0:
             time.sleep(POST_ANSWER_DELAY)
+        
+        # Increment answer counter
+        self.answers_count += 1
+        self.update_counter_display()
+        
+        # Check if we hit 10 answers
+        if self.answers_count >= 10:
+            self.answers_count = 0  # Reset counter
+            self.ready_count += 1   # Increment ready
+            print(f"[AUTO] 10 answers reached! Ready count: {self.ready_count}")
+            
+            # Wait 1 second before clicking AUTO_AREA_1
+            self.root.after(1000, self.auto_click_area_1_initial)
+            
+            # Check if ready count is 3
+            if self.ready_count >= 3:
+                print("[AUTO] Ready count is 3! Starting timed sequence...")
+                self.ready_count = 0  # Reset ready count
+                self.update_counter_display()
+                
+                # Wait 10 seconds after AUTO_AREA_1 clicked, then click AUTO_AREA_2
+                self.root.after(10000, self.auto_click_area_2)
+    
+    def auto_click_area_1_initial(self):
+        """Click AUTO_AREA_1 after 1 second delay"""
+        print(f"[AUTO] Clicking AUTO AREA 1 at {AUTO_AREA_1}")
+        pyautogui.click(AUTO_AREA_1)
+    
+    def auto_click_area_2(self):
+        """Click AUTO_AREA_2 after 10 second delay"""
+        print(f"[AUTO] Clicking AUTO AREA 2 at {AUTO_AREA_2}")
+        pyautogui.click(AUTO_AREA_2)
+        
+        # Wait 2 seconds, then click AUTO_AREA_3
+        self.root.after(2000, self.auto_click_area_3)
+    
+    def auto_click_area_3(self):
+        """Click AUTO_AREA_3 after 2 second delay"""
+        print(f"[AUTO] Clicking AUTO AREA 3 at {AUTO_AREA_3}")
+        pyautogui.click(AUTO_AREA_3)
+        
+        # Wait 8 seconds, then click AUTO_AREA_1 (final)
+        self.root.after(8000, self.auto_click_area_1_final)
+    
+    def auto_click_area_1_final(self):
+        """Click AUTO_AREA_1 after 2 second delay"""
+        print(f"[AUTO] Clicking AUTO AREA 1 (final) at {AUTO_AREA_1}")
+        pyautogui.click(AUTO_AREA_1)
+    
+    def update_counter_display(self):
+        """Update the counter text in GUI"""
+        self.counter_text.config(text=f"Answers: {self.answers_count}/10 | Ready: {self.ready_count}")
 
     def main_loop(self):
         try:
             if not self.paused:
                 img = ImageGrab.grab(bbox=self.question_area)
                 
-                # Fast image preprocessing (Numpy is faster than PIL lambda)
+                # Fast image preprocessing
                 img_array = np.array(img.convert("L"))
                 img_array[img_array < 140] = 0
                 img_array[img_array >= 140] = 255
