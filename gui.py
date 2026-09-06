@@ -21,6 +21,7 @@ from bot_core import (
     MAX_SLOTS, SCALE_X, SCALE_Y,
     MODE_HYBRID, MODE_CALC, MODE_LUT_ONLY,
     FAST_MODE_POLLING, STANDARD_MODE_POLLING,
+    CLICK_RESULT_CLICKED,
 )
 import bot_core  # for the mutable globals QUESTION_AREA etc.
 
@@ -122,9 +123,20 @@ class OpticalReaderSolverGUI:
         self._sct             = mss.mss()
         # MD5 of the last captured frame — if unchanged, skip OCR entirely
         self.last_frame_hash  = None
-        # Maps frame hash → (answer, source).  After the first OCR pass for any
-        # question, subsequent appearances skip EasyOCR entirely and answer in
-        # microseconds.  Capped at 500 entries (oldest evicted first).
+        # ── frame_answer_cache — PIXEL-LEVEL shortcut, bypasses OCR entirely ─
+        # frame MD5 hash → (answer, source). This is the odd one out among
+        # the four caches in this app (the other three key on the canonical
+        # *expression*; this one keys on raw pixels) — its entire premise is
+        # the assumption that identical pixels mean identical logical
+        # question state. That's normally true within one capture
+        # configuration, but stops being true the moment the capture region,
+        # fast/standard mode, or coordinate profile changes — the same pixel
+        # hash could then (in principle) mean something completely
+        # different. That's why every place that changes those things calls
+        # _clear_transient_state(), which empties this dict along with the
+        # core-side caches; nothing here is exempt from that reset. Capped
+        # at 500 entries (oldest evicted first) and never stores a failed
+        # OCR/solve attempt — see the comment at the write site below.
         self.frame_answer_cache = {}
 
         # ── Click confirmation ──────────────────────────────────────────────
@@ -414,13 +426,23 @@ class OpticalReaderSolverGUI:
 
     def sync_pause_state(self):
         """
-        Mirror core.paused into the GUI widgets.
-        Called via root.after(0, ...) from the hotkey listener thread
-        so it always runs on the tkinter main thread.
+        Mirror core.paused into the GUI widgets — the one authoritative
+        place that reacts to a pause/resume transition, regardless of which
+        of the two triggers caused it (the Pause/Resume button, handled in
+        _toggle_pause below, or the F8 hotkey, handled in bot_core.py —
+        both funnel through this).
         """
         if self.core.paused:
             self.status_label.config(text="●  Paused", fg=C_RED)
             self.pause_btn.config(text="▶  Resume")
+            # A pending confirmation is watching for the screen to react to
+            # a click, but nothing is being captured/processed while
+            # paused — its deadline would just tick past unobserved and
+            # later read as a false "unconfirmed" the moment we resume.
+            # Drop it: pausing didn't fail the click, it just means we
+            # stopped watching for the result.
+            self._pending_confirm_hash     = None
+            self._pending_confirm_deadline = None
         else:
             self.status_label.config(text="●  Running", fg=C_GREEN)
             self.pause_btn.config(text="❚❚  Pause")
@@ -440,20 +462,30 @@ class OpticalReaderSolverGUI:
 
     def _clear_transient_state(self, reason=""):
         """
-        Full reset of every cache that's only valid for the CURRENT capture
-        configuration (which screen region + which mode). Previously a
-        Fast/Standard switch only cleared answer_cache, and loading a
-        coordinate profile cleared nothing at all — so session_cache and
-        frame_answer_cache (keyed on pixel hashes from the OLD region/mode)
-        could keep serving answers that have nothing to do with what's now
-        on screen. Any change to what we're capturing or how we solve it
-        should invalidate all of these together.
+        Full reset of every cache/pending-state that's only valid for the
+        CURRENT capture configuration and round — the one authoritative
+        invalidation point, called from every place that changes what's
+        being captured or solved (mode switch, coordinate profile load,
+        manual reset, reset-to-defaults) and from core's own new-round
+        trigger. Previously a Fast/Standard switch only cleared
+        answer_cache, and loading a coordinate profile cleared nothing at
+        all — so session_cache, frame_answer_cache, and a pending click
+        confirmation (all keyed on the OLD region/mode/click) could keep
+        acting on state that has nothing to do with what's now on screen.
         """
         self.core.answer_cache.clear()
         self.core.session_cache.clear()
         self.frame_answer_cache.clear()
         self.last_frame_hash    = None
         self.core.last_question = ""
+        # A pending confirmation was watching for the screen to react to a
+        # click made under the OLD configuration — once that configuration
+        # has changed, its outcome (confirmed or not) no longer means
+        # anything, so drop it rather than let a stale timeout later count
+        # as a false "unconfirmed click" against the new configuration.
+        self._pending_confirm_hash     = None
+        self._pending_confirm_deadline = None
+        self._consecutive_unconfirmed  = 0
         self.update_cache_label(0)
         if reason:
             print(f"[GUI] Cleared session/frame cache ({reason})")
@@ -475,12 +507,8 @@ class OpticalReaderSolverGUI:
 
     def _toggle_pause(self):
         self.core.paused = not self.core.paused
-        if self.core.paused:
-            self.status_label.config(text="●  Paused", fg=C_RED)
-            self.pause_btn.config(text="▶  Resume")
-        else:
-            self.status_label.config(text="●  Running", fg=C_GREEN)
-            self.pause_btn.config(text="❚❚  Pause")
+        self.sync_pause_state()
+        if not self.core.paused:
             self.core._capture_target_window()
             # If user resumes while save-pending, cancel that state
             if self._edit_save_pending:
@@ -558,6 +586,13 @@ class OpticalReaderSolverGUI:
             # Cancel any in-progress sequences immediately
             self.core.cancel_all_scheduled_events()
             self.core.extended_sequence_active = False
+            # A pending confirmation was waiting to see whether the click
+            # that started it landed — with automation now off, there's
+            # nothing further to click, so its timeout no longer means
+            # anything either. Drop it rather than let it later count as an
+            # "unconfirmed click" for a state we've already left.
+            self._pending_confirm_hash     = None
+            self._pending_confirm_deadline = None
             self.auto_btn.config(text="Automation\nOff")
             self._style_button(self.auto_btn, "muted_off")
             if reason:
@@ -679,8 +714,7 @@ class OpticalReaderSolverGUI:
             # notice until it's already clicked something wrong).
             self._clear_transient_state(f"coordinate slot {idx+1} loaded")
             self._rebuild_overlays()
-            self.status_label.config(text="●  Paused", fg=C_RED)
-            self.pause_btn.config(text="▶  Resume")
+            self.sync_pause_state()
             print(f"[GUI] Slot {idx+1} loaded — click Resume when ready")
         if modal:
             modal.destroy()
@@ -698,7 +732,7 @@ class OpticalReaderSolverGUI:
         self.active_slot = None
         self._clear_transient_state("coordinates reset to defaults")
         self._rebuild_overlays()
-        self.status_label.config(text="●  Paused", fg=C_RED)
+        self.sync_pause_state()
         print("[GUI] Reset to defaults — click Resume when ready")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -844,8 +878,7 @@ class OpticalReaderSolverGUI:
         elif not self.core.fast_mode:
             for w in self.auto_overlays: w.withdraw()
 
-        self.status_label.config(text="●  Paused", fg=C_RED)
-        self.pause_btn.config(text="▶  Resume")
+        self.sync_pause_state()
         self.set_auto_status("Layout updated — save it, or Resume to try it out", "gray")
         print("[GUI] Edit mode OFF — coords applied. Save to slot or Resume to skip.")
 
@@ -1038,8 +1071,14 @@ class OpticalReaderSolverGUI:
                     cached_answer, cached_source = self.frame_answer_cache[current_hash]
                     if cached_answer is not None and self.core.last_question == "":
                         print(f"[GUI] [FRAME CACHE] {cached_answer}")
-                        self.core.click_answer(cached_answer, cached_source)
-                        if self.core.automation_enabled:
+                        click_result = self.core.click_answer(cached_answer, cached_source)
+                        # Only arm confirmation for a VERIFIED click — click_answer()
+                        # can return "known but not submitted" (automation off,
+                        # wrong window focused, unmapped answer) just as easily as
+                        # "clicked", and checking automation_enabled alone here
+                        # would arm a confirmation timer for a click that never
+                        # actually happened.
+                        if click_result == CLICK_RESULT_CLICKED:
                             self._pending_confirm_hash     = current_hash
                             self._pending_confirm_deadline = time.time() + self.CONFIRM_TIMEOUT
                         if self.core._last_question_reset_id is not None:
@@ -1071,8 +1110,10 @@ class OpticalReaderSolverGUI:
                         answer, source = self.core.handle_question(raw)
                         self._update_detected_display(raw, answer)
                         if answer is not None:
-                            self.core.click_answer(answer, source)
-                            if self.core.automation_enabled:
+                            click_result = self.core.click_answer(answer, source)
+                            # Same rule as the frame-cache path above: only a
+                            # verified CLICKED result arms confirmation.
+                            if click_result == CLICK_RESULT_CLICKED:
                                 self._pending_confirm_hash     = current_hash
                                 self._pending_confirm_deadline = time.time() + self.CONFIRM_TIMEOUT
                             if self.core._last_question_reset_id is not None:

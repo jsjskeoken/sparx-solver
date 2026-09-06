@@ -161,6 +161,18 @@ MODE_HYBRID   = "hybrid"   # LUT race + solver in parallel (default)
 MODE_CALC     = "calc"     # Force-solve every question, ignore LUT
 MODE_LUT_ONLY = "lut"      # Only use LUT/cache; skip if unknown
 
+# click_answer() outcomes. "The answer is known" and "the answer was
+# submitted" are different facts — this is what lets a caller (specifically
+# the GUI's click-confirmation logic) tell them apart instead of assuming
+# a click happened just because automation was enabled at the time. Plain
+# string constants rather than an enum class — this app doesn't need the
+# machinery, just names that mean one specific thing everywhere they appear.
+CLICK_RESULT_CLICKED         = "clicked"           # a real click was issued
+CLICK_RESULT_AUTOMATION_OFF  = "automation_off"     # known, not submitted — automation disabled
+CLICK_RESULT_WRONG_WINDOW    = "wrong_window"       # known, not submitted — target lost focus
+CLICK_RESULT_UNMAPPED_ANSWER = "unmapped_answer"    # known, not submitted — no key for a digit
+CLICK_RESULT_ERROR           = "click_error"        # attempted, something raised mid-click
+
 # ── Global hotkey ─────────────────────────────────────────────────────────────
 # Press this key combination from any window to toggle pause.
 # Default: F8  (change to e.g. pynput_keyboard.Key.f9, or a hotcombo like
@@ -220,16 +232,33 @@ class BotCore:
         self.automation_enabled       = True   # toggled by the Automation button
         self.scheduled_events         = []
 
-        # Session cache — tracks questions answered this round (fast mode only).
-        # Cleared on Reset / mode switch / new-session trigger.
-        # Completely separate from the LUT.
+        # ── answer_cache — "ANSWERED THIS ROUND" cache ──────────────────────
+        # canonical expression → answer that was actually processed/resolved
+        # this round (written only from click_answer(), after an answer is
+        # known — regardless of whether automation actually clicked it).
+        # Consulted only by LUT-ONLY mode, as a same-round supplement to the
+        # persistent LUT (so LUT-only mode can still answer something it
+        # JUST learned this session without writing it to the LUT file).
+        # Cleared on: manual reset, mode switch, coordinate profile load,
+        # new-round trigger. Never touches the LUT.
         self.answer_cache = {}
 
-        # High-speed session memory: expr → answer for the current round.
-        # Checked after the LUT so the same question never hits the solver twice.
+        # ── session_cache — Hybrid-mode SOLVE MEMOIZATION ───────────────────
+        # canonical expression → answer, written only by solve_math() right
+        # after a fresh eval()/SymPy solve. Checked by solve_math() itself
+        # (after the LUT, before running eval/SymPy again) purely so the
+        # same expression isn't solved twice in one round. Not consulted by
+        # any other mode. Cleared alongside answer_cache at the same reset
+        # points — genuinely different purpose from answer_cache above, kept
+        # as a separate dict deliberately rather than merged into one.
         self.session_cache = {}
 
-        # Persistent LUT — loaded from disk, never cleared except by user action
+        # ── lut — PERSISTENT store, survives restarts ───────────────────────
+        # canonical expression → answer, loaded from LUT_FILE at startup and
+        # written back to disk (atomically — see _save_lut_async) whenever a
+        # fresh solve produces a new entry. The only one of the four caches
+        # in this app that a reset/mode-switch/round-boundary never clears —
+        # only an explicit "Clear Saved Answers" from the user empties it.
         self.lut        = self._load_lut()
         self._lut_dirty = False
         # Serializes disk writes and lets a late-finishing stale write detect
@@ -571,16 +600,32 @@ class BotCore:
 
     def click_answer(self, answer, source='solve'):
         """
-        Click the answer on the on-screen keypad.
+        Attempt to submit the answer on the on-screen keypad. Returns one of
+        the CLICK_RESULT_* constants — "the answer is known" (this function
+        was called at all) and "the answer was actually clicked" are
+        different facts, and the return value is how a caller tells them
+        apart instead of assuming the second from the first.
+
         source: 'cache' | 'lut' | 'solve'
-        The session cache is updated here — this is the correct moment because
-        it reflects questions actually answered this session, not what the LUT knows.
+
+        Bookkeeping (the session cache) runs regardless of whether a click
+        was actually issued — the bot still "knows" the answer even when
+        automation is off, the target window isn't focused, or the answer
+        can't be represented on this keypad; only the CLICK_RESULT_* return
+        value says whether the mouse actually moved.
         """
         self.is_answering = True
+        result = None
         try:
-            # Cancel automation sequence if a fresh solve interrupts it
-            if self.extended_sequence_active and source == 'solve':
-                print("[CORE] New solve interrupted extended sequence — resetting")
+            # A new answer — regardless of whether it came from a fresh
+            # solve, the LUT, or the session cache — means a new question is
+            # being processed, which invalidates whatever the extended
+            # auto-sequence assumed about "we're between rounds". Previously
+            # this only checked source == 'solve', which (now that `source`
+            # is reported accurately instead of always being 'solve') would
+            # silently stop catching LUT/cache-sourced answers.
+            if self.extended_sequence_active:
+                print("[CORE] New answer interrupted extended sequence — resetting")
                 self.cancel_all_scheduled_events()
                 self.extended_sequence_active = False
                 if self.ui:
@@ -592,10 +637,9 @@ class BotCore:
             # ── Global safety switch ───────────────────────────────────────────
             # This is the ONLY place that actually issues clicks for an answer,
             # so it's the one place that must respect automation_enabled.
-            # Bookkeeping (session cache, counters) below still runs — the bot
-            # still "knows" the answer — it just never touches the mouse.
             if not self.automation_enabled:
                 print(f"[CORE] [{source.upper()}] Automation OFF — not clicking {answer_str}")
+                result = CLICK_RESULT_AUTOMATION_OFF
             else:
                 # Guard against clicking into the wrong window — e.g. the
                 # target app lost focus (alt-tab, a popup grabbed focus, the
@@ -603,36 +647,38 @@ class BotCore:
                 # currently has focus; it never reads anything from inside
                 # the target app itself, so it's the same "external" category
                 # as SetCursorPos — just a check instead of an action.
-                if self.target_hwnd is not None:
+                if self.target_hwnd is not None and (
+                        ctypes.windll.user32.GetForegroundWindow() != self.target_hwnd):
                     current_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                    if current_hwnd != self.target_hwnd:
-                        print(f"[CORE] [SKIP] Target window not focused "
-                              f"(expected {self.target_hwnd}, got {current_hwnd}) — not clicking")
-                        if self.ui:
-                            self.ui.set_auto_status("⚠ Target window lost focus — not clicking", "orange")
-                        return
+                    print(f"[CORE] [SKIP] Target window not focused "
+                          f"(expected {self.target_hwnd}, got {current_hwnd}) — not clicking")
+                    if self.ui:
+                        self.ui.set_auto_status("⚠ Target window lost focus — not clicking", "orange")
+                    result = CLICK_RESULT_WRONG_WINDOW
 
-                print(f"[CORE] [{source.upper()}] Clicking: {answer_str}")
-
-                if not all(d in self.key_coords for d in answer_str):
+                elif not all(d in self.key_coords for d in answer_str):
                     print(f"[CORE] [SKIP] '{answer_str}' has unmapped chars")
-                    return
+                    result = CLICK_RESULT_UNMAPPED_ANSWER
 
-                for d in answer_str:
-                    x, y = self.key_coords[d]
-                    fast_click(x, y)
-                    if KEY_PRESS_DELAY > 0:
-                        time.sleep(KEY_PRESS_DELAY)
+                else:
+                    print(f"[CORE] [{source.upper()}] Clicking: {answer_str}")
+                    for d in answer_str:
+                        x, y = self.key_coords[d]
+                        fast_click(x, y)
+                        if KEY_PRESS_DELAY > 0:
+                            time.sleep(KEY_PRESS_DELAY)
 
-                ok_x, ok_y = self.key_coords['OK']
-                fast_click(ok_x, ok_y)
-                if POST_ANSWER_DELAY > 0:
-                    time.sleep(POST_ANSWER_DELAY)
+                    ok_x, ok_y = self.key_coords['OK']
+                    fast_click(ok_x, ok_y)
+                    if POST_ANSWER_DELAY > 0:
+                        time.sleep(POST_ANSWER_DELAY)
+                    result = CLICK_RESULT_CLICKED
 
             # ── Update session cache ──────────────────────────────────────────
-            # Record every answered question in the session cache (fast mode).
-            # This is what makes cache hits happen for repeated questions within
-            # a round — completely independent of the LUT.
+            # Record every answered question in the session cache (fast mode) —
+            # runs regardless of `result`, per the "known vs submitted" split
+            # above. This is what makes cache hits happen for repeated
+            # questions within a round — completely independent of the LUT.
             # Must build this key exactly the way handle_question() does (full
             # normalise() + the fast-mode '=' / '?' strip), or a question can
             # get written here under one key and looked up under another —
@@ -648,9 +694,12 @@ class BotCore:
                     self.ui.update_cache_label(len(self.answer_cache))
 
             # ── Automation counter ────────────────────────────────────────────
-            # Only counts when automation is enabled and in fast mode.
-            # Cache hits still count — the question was answered regardless.
-            if self.automation_enabled and self.fast_mode and not self.extended_sequence_active:
+            # Only counts an actual click — previously gated on
+            # automation_enabled alone, which meant a wrong-window or
+            # unmapped-answer skip (automation still nominally "on") would
+            # still advance the counter toward triggering the auto-sequence,
+            # even though nothing was actually clicked that round.
+            if result == CLICK_RESULT_CLICKED and self.fast_mode and not self.extended_sequence_active:
                 self.answers_count += 1
                 if self.ui:
                     self.ui.update_counter_label(self.answers_count, self.ready_count)
@@ -680,8 +729,11 @@ class BotCore:
                         eid = self.ui.root.after(10000, self.auto_click_area_2)
                         self.scheduled_events.append(eid)
 
+            return result
+
         except Exception as e:
             print(f"[CORE] Click error: {e}")
+            return CLICK_RESULT_ERROR
         finally:
             self.is_answering = False
 
@@ -735,13 +787,25 @@ class BotCore:
             self.extended_sequence_active = False
 
     def clear_cache_for_new_session(self):
-        """Clear per-round caches at the start of a new round.
-        The LUT is untouched — it is never part of the session cache."""
-        self.answer_cache.clear()
-        self.session_cache.clear()
-        print("[CORE] Session caches cleared for new round")
+        """
+        Clear per-round transient state at the start of a new round. The LUT
+        is untouched — it's never part of round state.
+
+        Delegates to the GUI's _clear_transient_state() rather than only
+        clearing this object's own two dicts: core has no visibility into
+        the GUI's frame_answer_cache or last_frame_hash, and those are
+        exactly the kind of state that must NOT survive into a new round —
+        a stale pixel-hash entry from the previous round's screen could
+        otherwise serve an old answer without ever calling handle_question()
+        at all. Falls back to the old core-only clear if there's no UI
+        attached (e.g. running bot_core standalone/under test).
+        """
         if self.ui:
-            self.ui.update_cache_label(0)
+            self.ui._clear_transient_state("new round (extended sequence)")
+        else:
+            self.answer_cache.clear()
+            self.session_cache.clear()
+        print("[CORE] Session caches cleared for new round")
 
     def cancel_all_scheduled_events(self):
         for eid in self.scheduled_events:
@@ -779,6 +843,12 @@ class BotCore:
         right before writing (under the lock) and bails out instead of
         writing — so an older, smaller snapshot can never overwrite a newer
         one just because its thread happened to get scheduled second.
+
+        The write itself is atomic: we write to a temp file in the same
+        directory, then os.replace() it over the real path. os.replace is
+        atomic on both POSIX and Windows, so a crash or kill mid-write
+        leaves either the old complete file or the new complete file —
+        never a half-written, corrupt JSON file.
         """
         self._lut_write_seq += 1
         seq = self._lut_write_seq
@@ -790,8 +860,12 @@ class BotCore:
                     if seq != self._lut_write_seq:
                         print(f"[CORE] LUT write #{seq} superseded — skipping")
                         return
-                    with open(LUT_FILE, 'w') as f:
+                    tmp_path = LUT_FILE + f".tmp{seq}"
+                    with open(tmp_path, 'w') as f:
                         json.dump(snap, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, LUT_FILE)
             except Exception as e:
                 print(f"[CORE] LUT save error: {e}")
         threading.Thread(target=_write, args=(snapshot, seq), daemon=True).start()
