@@ -218,6 +218,8 @@ class BotCore:
         # "which window currently has focus", the same way SetCursorPos only
         # ever asks Windows to move the cursor.
         self.target_hwnd              = None
+        # Our own GUI's window handle — see set_gui_window()/_track_target_window()
+        self._gui_hwnd                = None
         self.fast_mode                = True
         self.current_polling          = FAST_MODE_POLLING
         self.solve_mode               = MODE_HYBRID
@@ -300,19 +302,45 @@ class BotCore:
         listener.start()
         print(f"[CORE] Hotkey listener active — press {PAUSE_HOTKEY} to toggle pause")
 
-    def _capture_target_window(self):
+    def set_gui_window(self, hwnd):
         """
-        Record whichever window currently has focus as the click target.
-        Call this at the moment automation resumes — right after you've
-        alt-tabbed into the target app — not before, or you'll capture your
-        own editor/terminal instead.
+        Record our own GUI's window handle once at startup, so the
+        foreground-window tracker below can tell "the GUI has focus" apart
+        from "the target app has focus" instead of ever mistaking one for
+        the other.
         """
+        self._gui_hwnd = hwnd
+
+    def _track_target_window(self):
+        """
+        Continuously remember whichever window last had focus and was NOT
+        our own GUI.
+
+        This replaces a one-shot "capture on resume" approach. Clicking
+        Resume (or any GUI button) necessarily focuses the GUI window for
+        that instant — Windows activates a window as part of delivering a
+        click to it — so capturing "whatever has focus right now" at the
+        moment Resume is pressed always captured the GUI itself, never the
+        app the user meant to automate. That made the foreground-window
+        guard below permanently block every click after using the Resume
+        button, since target_hwnd could never legitimately equal anything
+        but the GUI.
+
+        Calling this on every poll instead — paused or not — means that by
+        the time the user has actually switched back to the target app
+        (which necessarily happens at some point between pausing and the
+        next real click, whether they resume via this GUI or via F8), the
+        tracker has already picked it up. It's one cheap Win32 call, so
+        running it unconditionally costs nothing.
+        """
+        if self._gui_hwnd is None:
+            return
         try:
-            self.target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-            print(f"[CORE] Target window captured: {self.target_hwnd}")
+            fg = ctypes.windll.user32.GetForegroundWindow()
+            if fg != self._gui_hwnd:
+                self.target_hwnd = fg
         except Exception as e:
-            self.target_hwnd = None
-            print(f"[CORE] Could not capture target window: {e}")
+            print(f"[CORE] Foreground window tracking error: {e}")
 
     def _hotkey_toggle_pause(self):
         """
@@ -323,8 +351,6 @@ class BotCore:
         self.paused = not self.paused
         state = "PAUSED" if self.paused else "RUNNING"
         print(f"[HOTKEY] Bot {state}")
-        if not self.paused:
-            self._capture_target_window()
         if self.ui:
             # root.after is thread-safe; directly touching widgets is not
             self.ui.root.after(0, self.ui.sync_pause_state)
@@ -865,6 +891,18 @@ class BotCore:
                         json.dump(snap, f, indent=2)
                         f.flush()
                         os.fsync(f.fileno())
+                    # clear_lut() now takes this same lock for its whole
+                    # critical section, so it can't actually interleave here —
+                    # but re-checking immediately before the replace costs
+                    # nothing and means this stays correct even if that
+                    # invariant ever changes later.
+                    if seq != self._lut_write_seq:
+                        print(f"[CORE] LUT write #{seq} invalidated during write — discarding")
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        return
                     os.replace(tmp_path, LUT_FILE)
             except Exception as e:
                 print(f"[CORE] LUT save error: {e}")
@@ -885,15 +923,23 @@ class BotCore:
     def clear_lut(self):
         """Called by the GUI Clear LUT button. Only wipes the LUT — session cache is unaffected."""
         self.lut.clear()
-        # Invalidate any write already queued on a background thread — without
-        # this, a snapshot taken just before Clear was pressed can finish
-        # writing just after and silently recreate the file we just deleted.
-        self._lut_write_seq += 1
-        try:
-            if os.path.exists(LUT_FILE):
-                os.remove(LUT_FILE)
-        except Exception as e:
-            print(f"[CORE] LUT delete error: {e}")
+        # This must take the SAME lock the writer uses, not just bump the
+        # sequence number outside it. A writer can pass its sequence check,
+        # then get preempted before it reaches os.replace() — if clear_lut()
+        # ran in that window without holding the lock, it could increment
+        # the sequence and delete the file, and the writer would then still
+        # run its (already-passed) replace and silently recreate the file
+        # with the pre-clear snapshot. Taking the lock here makes the two
+        # operations mutually exclusive, closing that window; the writer
+        # also re-checks the sequence a second time immediately before its
+        # replace as defense in depth (see _save_lut_async).
+        with self._lut_write_lock:
+            self._lut_write_seq += 1
+            try:
+                if os.path.exists(LUT_FILE):
+                    os.remove(LUT_FILE)
+            except Exception as e:
+                print(f"[CORE] LUT delete error: {e}")
         print("[CORE] LUT cleared")
         if self.ui:
             self.ui.update_lut_label(0)

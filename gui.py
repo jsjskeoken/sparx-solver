@@ -140,10 +140,20 @@ class OpticalReaderSolverGUI:
         self.frame_answer_cache = {}
 
         # ── Click confirmation ──────────────────────────────────────────────
-        # We already hash every frame anyway (for the frame-answer-cache) —
-        # reuse that to check whether the screen actually changed after a
-        # click, instead of assuming click_answer() worked just because it
-        # didn't raise.
+        # Precisely what this does and doesn't prove: it's SCREEN-CHANGE
+        # detection, not answer-acceptance verification. We already hash
+        # every frame anyway (for the frame-answer-cache), so after a real
+        # click we watch for that hash to change within CONFIRM_TIMEOUT.
+        # A change means "the captured region looks different than it did
+        # right after we clicked" — that's a good, cheap signal that
+        # something happened, but it can't distinguish our click landing
+        # correctly from an unrelated animation in the same region, and it
+        # can't detect a click that landed on the wrong control but still
+        # caused *some* visible change. Getting real submission-accepted
+        # proof would mean knowing something about the target UI, which is
+        # out of scope for a purely external, pixel-level tool. Treat
+        # "confirmed" as "the region changed", not as "the answer was
+        # accepted" — the two usually coincide but aren't the same claim.
         self._pending_confirm_hash     = None  # frame hash right before the click
         self._pending_confirm_deadline = None  # time.time() by which we expect a change
         self._consecutive_unconfirmed  = 0
@@ -178,6 +188,15 @@ class OpticalReaderSolverGUI:
                             font=F_BODY, padding=(SP_2, SP_2),
                             relief="flat", borderwidth=0)
             style.map(name, background=[("active", bg)])
+
+        # Register our own window handle so the core's foreground-window
+        # tracker can tell "the GUI has focus" apart from "the target app
+        # has focus" — without this, clicking Resume would always look
+        # like the GUI itself just became the target, since Windows
+        # focuses a window as part of delivering a click to it.
+        raw_id = self.root.winfo_id()
+        parent = ctypes.windll.user32.GetParent(raw_id)
+        self.core.set_gui_window(parent if parent else raw_id)
 
     def _resize_to_fit(self):
         """
@@ -440,9 +459,14 @@ class OpticalReaderSolverGUI:
             # paused — its deadline would just tick past unobserved and
             # later read as a false "unconfirmed" the moment we resume.
             # Drop it: pausing didn't fail the click, it just means we
-            # stopped watching for the result.
+            # stopped watching for the result. Reset the whole streak, too —
+            # a deliberate pause is a clean boundary; carrying a 2-out-of-3
+            # unconfirmed count across it means one unrelated blip after
+            # resuming could trip the safety pause for something that
+            # happened in a completely different session of watching.
             self._pending_confirm_hash     = None
             self._pending_confirm_deadline = None
+            self._consecutive_unconfirmed  = 0
         else:
             self.status_label.config(text="●  Running", fg=C_GREEN)
             self.pause_btn.config(text="❚❚  Pause")
@@ -508,11 +532,9 @@ class OpticalReaderSolverGUI:
     def _toggle_pause(self):
         self.core.paused = not self.core.paused
         self.sync_pause_state()
-        if not self.core.paused:
-            self.core._capture_target_window()
-            # If user resumes while save-pending, cancel that state
-            if self._edit_save_pending:
-                self._edit_save_pending = False
+        # If user resumes while save-pending, cancel that state
+        if not self.core.paused and self._edit_save_pending:
+            self._edit_save_pending = False
         print(f"[GUI] Bot {'PAUSED' if self.core.paused else 'RUNNING'}")
 
     def _toggle_advanced(self):
@@ -589,10 +611,15 @@ class OpticalReaderSolverGUI:
             # A pending confirmation was waiting to see whether the click
             # that started it landed — with automation now off, there's
             # nothing further to click, so its timeout no longer means
-            # anything either. Drop it rather than let it later count as an
-            # "unconfirmed click" for a state we've already left.
+            # anything either. Drop it, and reset the streak too: manually
+            # turning automation off and back on is a deliberate action the
+            # user took specifically to reset the subsystem — carrying a
+            # partial unconfirmed-click count across that boundary means
+            # one more blip after re-enabling could trip the safety pause
+            # for clicks that happened before the user intervened at all.
             self._pending_confirm_hash     = None
             self._pending_confirm_deadline = None
+            self._consecutive_unconfirmed  = 0
             self.auto_btn.config(text="Automation\nOff")
             self._style_button(self.auto_btn, "muted_off")
             if reason:
@@ -1022,6 +1049,10 @@ class OpticalReaderSolverGUI:
           5. PIL for UI preview only, completely off the solver hot path
         """
         self.core._prune_scheduled_events()
+        # Runs every poll, paused or not — see _track_target_window()'s
+        # docstring for why this can't be a one-shot "capture on resume"
+        # instead.
+        self.core._track_target_window()
         try:
             if not self.core.paused:
                 area = (self.core.question_area_fast if self.core.fast_mode
